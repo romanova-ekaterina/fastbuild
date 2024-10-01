@@ -57,6 +57,10 @@ protected:
     bool CreateDynamicObjectNode( NodeGraph & nodeGraph,
                                   const AString & inputFileName,
                                   const AString & baseDir,
+                                  const AString& outputFile,
+                                  const AString& thinltoSummaryIndex,
+                                  const AString& thinltoModuleId,
+                                  const Array<AString>& thinltoImportsList,
                                   bool isUnityNode = false,
                                   bool isIsolatedFromUnityNode = false );
     ObjectNode * CreateObjectNode( NodeGraph & nodeGraph,
@@ -70,7 +74,10 @@ protected:
                                    const AString & preprocessorOptions,
                                    const AString & objectName,
                                    const AString & objectInput,
-                                   const AString & pchObjectName );
+                                   const AString & pchObjectName,
+                                   const AString& thinltoSummaryIndexFile,
+                                   const AString& thinltoModuleId,
+                                   const Array < AString>& thinltoImportsList );
 
     // Exposed Properties
     AString             m_Compiler;
@@ -103,6 +110,15 @@ protected:
     AString             m_PreprocessorOptions;
     Array< AString >    m_PreBuildDependencyNames;
     AString             m_ConcurrencyGroupName;
+
+    // DTLTO
+    Array< AString >    m_CompilerOutputFiles;        // Array of output object files.
+    AString             m_CompilerOptionsBitcode;     // Compiler options for IR bitcode code generation.
+    Array< AString >    m_ThinltoSummaryIndexFiles;   // Array of ThinLTO summary index files.
+    Array< AString >    m_ThinltoImportFiles;         // Array of ThinLTO imports list files.
+    Array< AString >    m_ThinltoImports;             // Array of strings. Each string contains a list of imports separated by semicolon.
+    Array< AString >    m_ThinltoModuleIds;           // Array of strings. Each string contains a Module ID for an input file.
+    AString             m_CompilerOptionModuleIdMap;  // Compiler option to specify a path to a Module ID map file.
 
     // Internal State
     AString             m_PrecompiledHeaderName;

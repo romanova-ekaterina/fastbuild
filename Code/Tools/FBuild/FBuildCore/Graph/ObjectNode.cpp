@@ -44,6 +44,7 @@
 #include "Core/FileIO/FileIO.h"
 #include "Core/FileIO/FileStream.h"
 #include "Core/FileIO/PathUtils.h"
+#include "Core/Math/Random.h"
 #include "Core/Math/xxHash.h"
 #include "Core/Process/Process.h"
 #include "Core/Profile/Profile.h"
@@ -52,7 +53,10 @@
 #include "Core/Tracing/Tracing.h"
 #include "Core/Strings/AStackString.h"
 
+//#define _OPEN_SYS_ITOA_EXT
 #include <string.h>
+#include <stdio.h>
+#include <stdlib.h>
 #if defined( __OSX__ ) || defined( __LINUX__ )
     #include <sys/time.h>
 #endif
@@ -92,6 +96,15 @@ REFLECT_NODE_BEGIN( ObjectNode, Node, MetaNone() )
     REFLECT( m_PCHCacheKey,                         "PCHCacheKey",                      MetaHidden() + MetaIgnoreForComparison() )
     REFLECT( m_OwnerObjectList,                     "OwnerObjectList",                  MetaHidden() )
     REFLECT( m_ConcurrencyGroupIndex,               "ConcurrencyGroupIndex",            MetaHidden() )
+
+    // DTLTO
+    REFLECT(m_CompilerOptionsBitcode,               "CompilerOptionsBitcode",           MetaOptional())
+    REFLECT(m_SummaryIndexFile,                     "SummaryIndex",                     MetaOptional() + MetaFile() + MetaAllowNonFile())
+    REFLECT(m_ThinltoModuleId,                      "ThinltoModuleId",                  MetaOptional())
+    REFLECT(m_ThinltoModuleIdMapFile,               "ThinltoModuleIdMapFile",           MetaOptional() + MetaFile() + MetaAllowNonFile())
+    REFLECT_ARRAY(m_ThinltoDependencyFiles,         "ThinltoDependencies",              MetaOptional() + MetaFile() + MetaAllowNonFile())
+    REFLECT(m_CompilerOptionModuleIdMap,            "CompilerOptionModuleIdMap",        MetaOptional() + MetaFile() + MetaAllowNonFile())
+
 REFLECT_END( ObjectNode )
 
 // CONSTRUCTOR
@@ -158,8 +171,38 @@ ObjectNode::ObjectNode()
         ASSERT( precompiledHeader.GetSize() == 1 );
     }
 
+    bool IsThinlto = false;
+    // ThinLTO summary index file.
+    Dependencies summaryIndexFile;
+    if (m_SummaryIndexFile.IsEmpty() == false)
+    {
+        IsThinlto = true;
+        if (!Function::GetFileNode(nodeGraph, iter, function, m_SummaryIndexFile, ".SummaryIndexFile", summaryIndexFile))
+        {
+            return false; // GetfileNode will have emitted an error
+        }
+    }
+    Dependencies thinltoDependencyFiles;
+    if (m_ThinltoDependencyFiles.IsEmpty() == false)
+    {
+        if (!Function::GetFileNodes(nodeGraph, iter, function, m_ThinltoDependencyFiles, ".ThinltoDependencyFiles", thinltoDependencyFiles))
+        {
+            return false; // GetFileNodes will have emitted an error
+        }
+    }
+    if (IsThinlto && !m_CompilerOptionsBitcode.IsEmpty()) {
+        AString CombinedCompilerOptions(m_CompilerOptionsBitcode);
+        CombinedCompilerOptions += " ";
+        if (!m_CompilerOptionModuleIdMap.IsEmpty()) {
+            CombinedCompilerOptions += m_CompilerOptionModuleIdMap;
+            CombinedCompilerOptions += " ";
+        }
+        CombinedCompilerOptions += m_CompilerOptions;
+        m_CompilerOptions = CombinedCompilerOptions;
+    }
     // Store Dependencies
-    m_StaticDependencies.SetCapacity( 1 + 1 + precompiledHeader.GetSize() + ( preprocessor ? 1 : 0 ) + compilerForceUsing.GetSize() );
+    size_t staticDepsSize = (2 + 2 + precompiledHeader.GetSize() + (preprocessor ? 1 : 0) + compilerForceUsing.GetSize() + thinltoDependencyFiles.GetSize() + summaryIndexFile.GetSize());
+    m_StaticDependencies.SetCapacity( staticDepsSize );
     m_StaticDependencies.Add( compiler );
     m_StaticDependencies.Add( compilerInputFile );
     m_StaticDependencies.Add( precompiledHeader );
@@ -168,6 +211,9 @@ ObjectNode::ObjectNode()
         m_StaticDependencies.Add( preprocessor );
     }
     m_StaticDependencies.Add( compilerForceUsing );
+
+    m_StaticDependencies.Add(summaryIndexFile);
+    m_StaticDependencies.Add(thinltoDependencyFiles);
 
     return true;
 }
@@ -241,6 +287,29 @@ ObjectNode::~ObjectNode()
     const bool useCache = ShouldUseCache();
     const bool useDist = m_CompilerFlags.IsDistributable() && m_AllowDistribution && FBuild::Get().GetOptions().m_AllowDistributed;
     const bool useSimpleDist = GetCompiler()->SimpleDistributionMode();
+
+    bool isThinlto = m_SummaryIndexFile.IsEmpty() == false;
+    if (isThinlto) {
+        if(!useDist)
+            return DoBuildOther(job, useDeoptimization);
+        else {
+            MultiBuffer mb;
+            Array<AString> fileNames;
+            fileNames.EmplaceBack(m_CompilerInputFile);
+            fileNames.EmplaceBack(m_SummaryIndexFile);
+            for(const AString& depFileName : m_ThinltoDependencyFiles)
+                fileNames.EmplaceBack(depFileName);
+            size_t problemIndex = 0;
+            if(!mb.CreateFromFiles(fileNames, &problemIndex))
+                return BuildResult::eFailed; // HandleFileDeletion will have emitted an error
+            // yes... re-queue for secondary build
+            size_t bufferSize;
+            void* bufferPtr = mb.Release(bufferSize);
+            job->OwnData(bufferPtr, bufferSize);
+            return BuildResult::eNeedSecondPass;
+        }
+    }
+
     bool usePreProcessor = !useSimpleDist && ( useCache || useDist || IsGCC() || IsSNC() || IsClang() || IsClangCl() || IsCodeWarriorWii() || IsGreenHillsWiiU() || IsVBCC() || IsOrbisWavePSSLC() );
     if ( GetDedicatedPreprocessor() )
     {
@@ -278,6 +347,49 @@ ObjectNode::~ObjectNode()
     // we may be using deoptimized options, but they are always
     // the "normal" args when remote compiling
     const bool useDeoptimization = job->IsLocal() && ShouldUseDeoptimization();
+
+    bool isThinlto = m_SummaryIndexFile.IsEmpty() == false;
+    if (isThinlto) {
+        AString tmpDirectoryName;
+        Array<AString> tmpFileNames;
+        if (!WriteThinltoDependencies(job, tmpDirectoryName, tmpFileNames))
+            return BuildResult::eFailed; // HandleFileDeletion will have emitted an error
+
+        Args fullArgs;
+        const bool showIncludes(false);
+        const bool useSourceMapping(true);
+        const bool finalize(true);
+        AString overridedSourceFile ( tmpFileNames[0]);
+        AString overridedSummaryFile( tmpFileNames[1]);
+        AString overridedModuleIdMapFile(tmpFileNames[2]);
+
+        if (!BuildArgs(job, fullArgs, PASS_COMPILE, useDeoptimization, showIncludes, useSourceMapping, finalize,
+            overridedSourceFile, overridedSummaryFile, overridedModuleIdMapFile))
+        {
+            return BuildResult::eFailed; // BuildArgs will have emitted an error 
+        }
+
+        EmitCompilationMessage(fullArgs, useDeoptimization);
+        const BuildResult result = BuildFinalOutput(job, fullArgs, tmpDirectoryName);
+
+        // record new file time
+        RecordStampFromBuiltFile();
+
+        // cleanup temp files
+        for (const AString& tmpName : tmpFileNames)
+        {
+            if(PathUtils::ArePathsEqual(tmpName, GetThinltoModuleId())) continue; // do not delete original input file.
+            FileIO::FileDelete(tmpName.Get());
+        }
+
+        // cleanup temp directory
+        if (tmpDirectoryName.IsEmpty() == false)
+        {
+            FileIO::DirectoryDelete(tmpDirectoryName);
+        }
+        return result;
+    }
+
     const bool stealingRemoteJob = job->IsLocal(); // are we stealing a remote job?
     const bool isFollowingLightCacheMiss = false;
     return DoBuildWithPreProcessor2( job, useDeoptimization, stealingRemoteJob, racingRemoteJob, isFollowingLightCacheMiss );
@@ -667,7 +779,7 @@ Node::BuildResult ObjectNode::DoBuildWithPreProcessor2( Job * job, bool useDeopt
         }
     #endif
 
-    const BuildResult result = BuildFinalOutput( job, fullArgs );
+    const BuildResult result = BuildFinalOutput( job, fullArgs, AString::GetEmpty());
 
     // cleanup temp file
     if ( tmpFileName.IsEmpty() == false )
@@ -801,7 +913,9 @@ Node::BuildResult ObjectNode::DoBuild_QtRCC( Job * job )
     const bool showIncludes( false );
     const bool useSourceMapping( true );
     const bool finalize( true );
-    if ( !BuildArgs( job, fullArgs, PASS_COMPILE, useDeoptimization, showIncludes, useSourceMapping, finalize ) )
+    // In a case when we compiling a bitcode file we need to specify its module ID on the command line.
+    AString overideSource(m_SummaryIndexFile.IsEmpty() ? AString::GetEmpty() : m_ThinltoModuleId);
+    if ( !BuildArgs( job, fullArgs, PASS_COMPILE, useDeoptimization, showIncludes, useSourceMapping, finalize, overideSource ) )
     {
         return BuildResult::eFailed; // BuildArgs will have emitted an error
     }
@@ -928,10 +1042,33 @@ bool ObjectNode::ProcessIncludesWithPreProcessor( Job * job )
     {
         return nullptr;
     }
+ // DTLTO
+    AString summaryIndexFile;
+    AString bitcodeModuleId;
+    AString compilerOptionModuleIdMap;
+    Array<AString> thinltoDependencyFiles;
 
-    NodeProxy * srcFile = FNEW( NodeProxy( Move( sourceFile ) ) );
+    if (!stream.Read(summaryIndexFile))
+        return nullptr;
+    if (!stream.Read(bitcodeModuleId))
+        return nullptr;
+    if (!stream.Read(compilerOptionModuleIdMap))
+        return nullptr;
+    if (!stream.Read(thinltoDependencyFiles))
+        return nullptr;
 
-    return FNEW( ObjectNode( Move( name ), srcFile, compilerArgs, flags ) );
+    NodeProxy* srcFile = FNEW(NodeProxy(Move(sourceFile)));
+
+    ObjectNode* objNode = FNEW(ObjectNode(Move(name), srcFile, compilerArgs, flags));
+    if (!objNode)
+        return nullptr;
+
+    objNode->m_CompilerInputFile = srcFile->GetName();
+    objNode->m_SummaryIndexFile = Move(summaryIndexFile);
+    objNode->m_ThinltoModuleId = Move(bitcodeModuleId);
+    objNode->m_CompilerOptionModuleIdMap = Move(compilerOptionModuleIdMap);
+    objNode->m_ThinltoDependencyFiles = Move(thinltoDependencyFiles);
+    return objNode;
 }
 
 // DetermineFlags
@@ -1256,6 +1393,11 @@ bool ObjectNode::ProcessIncludesWithPreProcessor( Job * job )
     driver->AddAdditionalArgs_PreparePreprocessedForRemote( fullArgs );
 
     stream.Write( fullArgs.GetRawArgs() );
+    // DTLTO
+    stream.Write(m_SummaryIndexFile);
+    stream.Write(m_ThinltoModuleId);
+    stream.Write(m_CompilerOptionModuleIdMap);
+    stream.Write(m_ThinltoDependencyFiles);
 }
 
 // GetCompiler
@@ -1756,7 +1898,8 @@ void ObjectNode::EmitCompilationMessage( const Args & fullArgs, bool useDeoptimi
 
 // BuildArgs
 //------------------------------------------------------------------------------
-bool ObjectNode::BuildArgs( const Job * job, Args & fullArgs, Pass pass, bool useDeoptimization, bool showIncludes, bool useSourceMapping, bool finalize, const AString & overrideSrcFile ) const
+bool ObjectNode::BuildArgs( const Job * job, Args & fullArgs, Pass pass, bool useDeoptimization, bool showIncludes,
+    bool useSourceMapping, bool finalize, const AString & overrideSrcFile, const AString& overrideSummaryIndexFile, const AString& overrideModuleIdMapFile) const
 {
     PROFILE_FUNCTION;
 
@@ -1796,6 +1939,8 @@ bool ObjectNode::BuildArgs( const Job * job, Args & fullArgs, Pass pass, bool us
     CreateDriver( flags, job->GetRemoteSourceRoot(), driver );
 
     driver->SetOverrideSourceFile( overrideSrcFile );
+    driver->SetOverrideSummaryIndexFile(overrideSummaryIndexFile);
+    driver->SetOverrideModuleIdMapFile(overrideModuleIdMapFile);
     driver->SetRelativeBasePath( basePath );
     driver->SetForceColoredDiagnostics( forceColoredDiagnostics );
     driver->SetUseSourceMapping( ( useSourceMapping && job->IsLocal() ) ? GetCompiler()->GetSourceMapping() : AString::GetEmpty() );
@@ -2209,13 +2354,261 @@ bool ObjectNode::WriteTmpFile( Job * job, AString & tmpDirectory, AString & tmpF
     return true;
 }
 
+
+#if defined( __WINDOWS__ )
+#pragma warning( disable : 4996)
+#endif
+
+// WriteThinltoDependencies
+//------------------------------------------------------------------------------
+bool ObjectNode::WriteThinltoDependencies(Job* job, AString& tmpDirectory, Array<AString>& tmpFiles) const
+{
+    ASSERT(job->GetData() && job->GetDataSize());
+
+    if (!IsClang())
+    {
+        job->Error("ThinLTO code generation is only supported by the Clang compiler.");
+        return false;
+    }
+
+    const Node* sourceFile = GetSourceFile();
+    const uint32_t sourceNameHash = xxHash::Calc32(sourceFile->GetName().Get(), sourceFile->GetName().GetLength());
+
+    void const* dataToWrite = job->GetData();
+    size_t dataToWriteSize = job->GetDataSize();
+
+    MultiBuffer mb(dataToWrite, dataToWriteSize);
+
+    // handle compressed data
+    if (job->IsDataCompressed())
+    {
+        VERIFY(mb.Decompress());
+    }
+
+    bool compilerSupportsModuleIdMap = !m_CompilerOptionModuleIdMap.IsEmpty();
+
+    WorkerThread::GetTempFileDirectory(tmpDirectory);
+    tmpDirectory.AppendFormat("%08X%c", sourceNameHash, NATIVE_SLASH);
+
+    Random randGenerator;
+
+    Array<AString> canonicalFilePaths;
+    int32_t numOfAbsPaths = 0, levelsUpFromCurrentDir = 0;
+
+    if (!compilerSupportsModuleIdMap)
+    {
+        Array<AString> dependenciesFilePaths( GetThinltoDependencyFiles());
+
+        //dependenciesFilePaths.Append( GetSummaryIndexFile());
+        dependenciesFilePaths.Append( GetThinltoModuleId());
+
+        if (!AnalyzeFilePaths(dependenciesFilePaths, canonicalFilePaths, numOfAbsPaths, levelsUpFromCurrentDir))
+            return false;
+        if (numOfAbsPaths)
+        {
+            job->Error(
+                "The list of dependecies files constains %d of absolute paths. This is only supported if a compiler supports the Module Id map file, "
+                "Target: '%s'",
+                numOfAbsPaths, GetName().Get());
+            job->OnSystemError();
+            return false;
+        }
+        for (int32_t levelUp = 0; levelUp < levelsUpFromCurrentDir; ++levelUp)
+        {
+            AString levelUpString;
+            uint32_t randNum = randGenerator.GetRand();
+            levelUpString.Format( "%x", randNum );
+            tmpDirectory.AppendFormat("%s%c", levelUpString.Get(), NATIVE_SLASH);
+        }
+    }
+
+#ifdef __DEBUG__
+    for(const AString& dirPath : canonicalFilePaths) {
+        printf("canonical path %s\n", dirPath.Get() );
+    }
+#endif
+
+    auto ensureDirectoryPathExists = [this, &job](const AString& filePath ) -> bool {
+        AString dirPath;
+        PathUtils::GetDirectoryName(filePath, dirPath);
+
+#ifdef __DEBUG__
+        printf("Dependency file directory %s\n" , dirPath.begin());
+#endif
+
+        if(!dirPath.IsEmpty()) {
+            if (FileIO::EnsurePathExists(dirPath) == false)
+            {
+                    job->Error("Failed to create temp directory. Error: %s TmpDir: '%s' Target: '%s'", LAST_ERROR_STR, dirPath.Get(), GetName().Get());
+                    job->OnSystemError();
+                    return false;
+            }
+        }
+        return true;
+    };
+
+    if (!ensureDirectoryPathExists(tmpDirectory)) return false;
+
+
+    AString sourceFilePath(tmpDirectory);
+    AString sourceBaseName;
+    PathUtils::GetBaseName(sourceFile->GetName(), sourceBaseName);
+    PathUtils::JoinPath(sourceFilePath, sourceBaseName);
+
+    if(!ensureDirectoryPathExists(sourceFilePath)) return false;
+
+    if (!compilerSupportsModuleIdMap)
+        // We need to specify a Module ID on the command line.
+        tmpFiles.EmplaceBack(GetThinltoModuleId());
+    else
+        tmpFiles.EmplaceBack(sourceFilePath);
+
+    if (mb.ExtractFile(0, sourceFilePath) == false)
+    {
+        job->Error("Failed to write to compiler input file. Error: %s Compiler input file: '%s' Target: '%s'", LAST_ERROR_STR, sourceFilePath.Get(),
+                   GetName().Get());
+        job->OnSystemError();
+        return false;
+    }
+
+    AString summaryIndexPath(tmpDirectory);
+    AString summaryBaseName;
+    PathUtils::GetBaseName(GetSummaryIndexFile(), summaryBaseName);
+    PathUtils::JoinPath(summaryIndexPath, summaryBaseName);
+
+    if(!ensureDirectoryPathExists(summaryIndexPath)) return false;
+
+    tmpFiles.EmplaceBack(summaryIndexPath);
+
+    if (mb.ExtractFile(1, summaryIndexPath) == false)
+    {
+        job->Error("Failed to write to summary index file. Error: %s Summary Index file: '%s' Target: '%s'", LAST_ERROR_STR, summaryIndexPath.Get(),
+                   GetName().Get());
+        job->OnSystemError();
+        return false;
+    }
+
+    if (!compilerSupportsModuleIdMap)
+    {
+        SetThinltoModuleIdMapFile(AString::GetEmpty());
+
+        tmpFiles.EmplaceBack(AString::GetEmpty());  // Module Id map file == empty string
+
+        for (size_t idx = 0; idx < GetThinltoDependencyFiles().GetSize(); ++idx)
+        {
+            const AString& dependencyFile = GetThinltoDependencyFiles()[idx];
+
+            AString fullDependencyFilePath(tmpDirectory);
+            PathUtils::JoinPath( fullDependencyFilePath, dependencyFile);
+
+            if(!ensureDirectoryPathExists(fullDependencyFilePath)) return false;
+
+            tmpFiles.EmplaceBack(fullDependencyFilePath);
+
+            if (mb.ExtractFile(idx + 2, fullDependencyFilePath) == false)
+            {
+                job->Error("Failed to write to dependency file. Error: %s Dependency file: '%s' Target: '%s'", LAST_ERROR_STR, fullDependencyFilePath.Get(),
+                           GetName().Get());
+                job->OnSystemError();
+                return false;
+            }
+        }
+    }
+    else
+    {
+        AString mapFileName;
+        PathUtils::GetBaseName(sourceFile->GetName(), mapFileName);
+        mapFileName += ".thinlto.map";
+
+        FileStream mapFileStream;
+        AString mapFilePath(tmpDirectory);
+        PathUtils::JoinPath( mapFilePath, mapFileName);
+
+        SetThinltoModuleIdMapFile( mapFilePath);
+
+        if (!mapFileStream.Open(mapFilePath.Get(), FileStream::WRITE_ONLY))
+        {
+            FileIO::WorkAroundForWindowsFilePermissionProblem(mapFileName, FileStream::WRITE_ONLY, 15);  // 15 secs max wait
+            // Try again
+            if (!mapFileStream.Open(mapFileName.Get(), FileStream::WRITE_ONLY))
+            {
+                job->Error("Failed to create ThinLTO map file. Error: %s TmpDir: '%s' Target: '%s'", LAST_ERROR_STR, tmpDirectory.Get(), mapFilePath.Get());
+                job->OnSystemError();
+                return false;
+            }
+        }
+
+        auto generateDependencySuffix = [&randGenerator](size_t i, AString& s) -> void
+        {
+            if (i == size_t(-1))
+            {
+                uint32_t randNum = randGenerator.GetRand();
+                s.Format( "%x", randNum );
+            }
+            else
+            {
+                AStackString<128> str;
+                ::snprintf(str.Get(), str.GetLength(), "%d.bc", (int32_t)i);
+                s.Assign(str);
+            }
+        };
+
+        tmpFiles.EmplaceBack(mapFilePath);
+
+        // Create an entry for an input bitcode file.
+        mapFileStream.WriteRawV(GetThinltoModuleId(), AString("\t"), sourceFilePath, AString("\n"));
+
+        for (size_t idx = 0; idx < GetThinltoDependencyFiles().GetSize(); ++idx)
+        {
+            const AString& dependencyFile = GetThinltoDependencyFiles()[idx]; // essentially this is a Module Id.
+            AString dependencyBaseName;
+            PathUtils::GetBaseName(dependencyFile, dependencyBaseName);
+
+            // Write item into dependencies map file.
+            mapFileStream.WriteRawV(dependencyFile, AString("\t"));
+
+            AString fullDependencyFilePath(tmpDirectory);
+            PathUtils::JoinPath( fullDependencyFilePath, dependencyBaseName);
+
+            // Since we will save dependencies files into one flat directory we need to guarantee uniqueness of a file name path.
+            // Simplest way to do that is to add a suffix to the file name which is a sequential number of a file in the list.
+            AString dependencyPathSuffix;
+            generateDependencySuffix(size_t(-1), dependencyPathSuffix);
+            fullDependencyFilePath.AppendFormat(".%s", dependencyPathSuffix.Get());
+
+            mapFileStream.WriteRawV(fullDependencyFilePath, AString("\n"));
+
+            tmpFiles.EmplaceBack(fullDependencyFilePath);
+
+            if (mb.ExtractFile(idx + 2, fullDependencyFilePath) == false)
+            {
+                job->Error("Failed to write to dependency file. Error: %s Dependency file: '%s' Target: '%s'", LAST_ERROR_STR, fullDependencyFilePath.Get(),
+                           GetName().Get());
+                job->OnSystemError();
+                return false;
+            }
+        }
+
+        mapFileStream.Flush();
+    }
+
+    // On remote workers, free compressed buffer as we don't need it anymore
+    // This reduces memory consumed on the remote worker.
+    if (job->IsLocal() == false)
+    {
+        job->OwnData(nullptr, 0, false);  // Free compressed buffer
+    }
+
+    return true;
+}
+
 // BuildFinalOutput
 //------------------------------------------------------------------------------
-Node::BuildResult ObjectNode::BuildFinalOutput( Job * job, const Args & fullArgs ) const
+Node::BuildResult ObjectNode::BuildFinalOutput( Job * job, const Args & fullArgs, const AString& tmpDirectory ) const
 {
     // Use the remotely synchronized compiler if building remotely
     AStackString<> compiler;
-    AStackString<> workingDir;
+    AStackString<> workingDir(tmpDirectory);
     if ( job->IsLocal() )
     {
         compiler = GetCompiler()->GetExecutable();
@@ -2224,7 +2617,8 @@ Node::BuildResult ObjectNode::BuildFinalOutput( Job * job, const Args & fullArgs
     {
         ASSERT( job->GetToolManifest() );
         job->GetToolManifest()->GetRemoteFilePath( 0, compiler );
-        job->GetToolManifest()->GetRemotePath( workingDir );
+        if (tmpDirectory.IsEmpty())
+            job->GetToolManifest()->GetRemotePath( workingDir );
     }
 
     // spawn the process

@@ -29,6 +29,8 @@ public:
     void SetUseSourceMapping( const AString & sourceMapping ) { m_SourceMapping = sourceMapping; }
     void SetRelativeBasePath( const AString & relativeBasePath ) { m_RelativeBasePath = relativeBasePath; }
     void SetOverrideSourceFile( const AString & overrideSourceFile ) { m_OverrideSourceFile= overrideSourceFile; }
+    void SetOverrideSummaryIndexFile(const AString& overrideSummaryIndexFile) { m_OverrideSummaryIndexFile = overrideSummaryIndexFile; }
+    void SetOverrideModuleIdMapFile(const AString& overrideModuleIdMapFile) { m_OverrideModuleIdMapFile = overrideModuleIdMapFile; }
 
     // Manipulate args if needed for various compilation modes
     virtual bool ProcessArg_PreprocessorOnly( const AString & token,
@@ -75,6 +77,8 @@ protected:
     AString             m_RelativeBasePath;
     AString             m_OverrideSourceFile;
     AString             m_RemoteSourceRoot;
+    AString             m_OverrideSummaryIndexFile;
+    AString             m_OverrideModuleIdMapFile;
 };
 
 //------------------------------------------------------------------------------

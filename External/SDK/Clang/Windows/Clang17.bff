@@ -117,12 +117,10 @@ Compiler( 'Compiler-Clang17-NonCL' )
                                     + ' -Wno-switch-enum'               // Allow the use of "default" labels (we keep -Wswitch to ensure all cases are handled)
 
                                     // Warnings that fire but might be best to be fixed
-                                    + ' -Wno-cast-function-type-strict' // converts to incompatible function type
                                     + ' -Wno-cast-qual'                 // cast from 'const %s *' to '%s *' drops const qualifier
                                     + ' -Wno-deprecated-copy-dtor'      // definition of implicit copy constructor for '%s' is deprecated because it has a user-declared destructor
                                     + ' -Wno-missing-noreturn'          // function '%s' could be declared with attribute 'noreturn'
                                     + ' -Wno-old-style-cast'            // use of old-style cast
-                                    + ' -Wno-unsafe-buffer-usage'       // unsafe pointer arithmetic
 
     // File Extensions
     .LibExtension                   = '.a'

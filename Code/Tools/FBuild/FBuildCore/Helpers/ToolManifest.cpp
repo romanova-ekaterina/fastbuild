@@ -53,6 +53,7 @@ ToolManifestFile::ToolManifestFile( const AString & name, uint64_t stamp, uint32
     , m_TimeStamp( stamp )
     , m_Hash( hash )
     , m_UncompressedContentSize( size )
+    , m_CompressedContentSize(0)
 {}
 
 // DESTRUCTOR (ToolManifestFile)
@@ -115,7 +116,8 @@ bool ToolManifestFile::DoBuild()
 
     // Should not have any file data in memory
     ASSERT( m_CompressedContent == nullptr );
-    ASSERT( m_CompressedContentSize == 0 );
+
+    //ASSERT( m_CompressedContentSize == 0 ); // This will stored in the database file (.FDB) and gets restored if database file exists.
 
     // Do we already have a hash?
     if ( m_Hash != 0 )

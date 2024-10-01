@@ -24,6 +24,9 @@
 #include "Core/Math/xxHash.h"
 #include "Core/Strings/AStackString.h"
 
+#include <stdlib.h>
+#include <string.h>
+
 // Reflection
 //------------------------------------------------------------------------------
 REFLECT_NODE_BEGIN( ObjectListNode, Node, MetaNone() )
@@ -74,6 +77,18 @@ REFLECT_NODE_BEGIN( ObjectListNode, Node, MetaNone() )
     REFLECT( m_CompilerFlags.m_Flags,               "ObjFlags",                         MetaHidden() )
     REFLECT( m_PreprocessorFlags.m_Flags,           "ObjFlagsPreprocessor",             MetaHidden() )
     REFLECT( m_ConcurrencyGroupIndex,               "ConcurrencyGroupIndex",            MetaHidden() )
+
+    // DTLTO
+    REFLECT_ARRAY( m_CompilerOutputFiles,           "CompilerOutputFiles",             MetaOptional() + MetaFile() + MetaAllowNonFile())
+    REFLECT( m_CompilerOptionsBitcode,              "CompilerOptionsBitcode",          MetaOptional())
+    // List of the ThinLTO summary index files.
+    REFLECT_ARRAY( m_ThinltoSummaryIndexFiles,      "ThinltoSummaryIndexFiles",        MetaOptional() + MetaFile() + MetaAllowNonFile() )
+    // List of files each of it contains a list of imports bitcode files.
+    REFLECT_ARRAY( m_ThinltoImportFiles,            "ThinltoImportFiles",              MetaOptional() + MetaFile() + MetaAllowNonFile() )
+    REFLECT_ARRAY( m_ThinltoImports,                "ThinltoImports",                  MetaOptional() )
+    REFLECT_ARRAY( m_ThinltoModuleIds,              "ThinltoModuleIds",                MetaOptional())
+    REFLECT( m_CompilerOptionModuleIdMap,           "CompilerOptionModuleIdMap",       MetaOptional() )
+
 REFLECT_END( ObjectListNode )
 
 // ObjectListNode
@@ -174,7 +189,8 @@ ObjectListNode::ObjectListNode()
         }
 
         // Create the PCH node
-        precompiledHeader = CreateObjectNode( nodeGraph, iter, function, pchFlags, ObjectNode::CompilerFlags(), m_PCHOptions, AString::GetEmpty(), AString::GetEmpty(), AString::GetEmpty(), m_PCHOutputFile, m_PCHInputFile, pchObjectName );
+        Array<AString> emptyStringsArray;
+        precompiledHeader = CreateObjectNode( nodeGraph, iter, function, pchFlags, ObjectNode::CompilerFlags(), m_PCHOptions, AString::GetEmpty(), AString::GetEmpty(), AString::GetEmpty(), m_PCHOutputFile, m_PCHInputFile, pchObjectName, AString::GetEmpty(), AString::GetEmpty(), emptyStringsArray);
         if ( precompiledHeader == nullptr )
         {
             return false; // CreateObjectNode will have emitted an error
@@ -310,6 +326,13 @@ ObjectListNode::ObjectListNode()
         {
             return false; // GetFileNode will have emitted an error
         }
+        if (!m_ThinltoSummaryIndexFiles.IsEmpty()) {
+            Dependencies thinltoSummaryIndexFiles;
+            if (!Function::GetFileNodes(nodeGraph, iter, function, m_ThinltoSummaryIndexFiles, "ThinltoSummaryIndexFiles", thinltoSummaryIndexFiles))
+            {
+                return false; // GetFileNode will have emitted an error
+            }
+        }
     }
 
     // .CompilerInputObjectLists
@@ -394,7 +417,7 @@ ObjectListNode::~ObjectListNode() = default;
                 #endif
 
                 // create the object that will compile the above file
-                if ( CreateDynamicObjectNode( nodeGraph, n->GetName(), dln->GetPath() ) == false )
+                if ( CreateDynamicObjectNode( nodeGraph, n->GetName(), dln->GetPath(), AString::GetEmpty(), AString::GetEmpty(), AString::GetEmpty(), Array<AString>() ) == false )
                 {
                     return false; // CreateDynamicObjectNode will have emitted error
                 }
@@ -420,7 +443,7 @@ ObjectListNode::~ObjectListNode() = default;
                 }
 
                 // create the object that will compile the above file
-                if ( CreateDynamicObjectNode( nodeGraph, n->GetName(), AString::GetEmpty(), true ) == false )
+                if ( CreateDynamicObjectNode( nodeGraph, n->GetName(), AString::GetEmpty(), AString::GetEmpty(), AString::GetEmpty(), AString::GetEmpty(), Array<AString>(), true ) == false )
                 {
                     return false; // CreateDynamicObjectNode will have emitted error
                 }
@@ -441,7 +464,7 @@ ObjectListNode::~ObjectListNode() = default;
                 }
 
                 // create the object that will compile the above file
-                if ( CreateDynamicObjectNode( nodeGraph, n->GetName(), isolatedFile.GetDirListOriginPath(), false, true ) == false )
+                if ( CreateDynamicObjectNode( nodeGraph, n->GetName(), isolatedFile.GetDirListOriginPath(), AString::GetEmpty(), AString::GetEmpty(), AString::GetEmpty(), Array<AString>(), false, true ) == false )
                 {
                     return false; // CreateDynamicObjectNode will have emitted error
                 }
@@ -470,7 +493,7 @@ ObjectListNode::~ObjectListNode() = default;
                 }
 
                 // create the object that will compile the above file
-                if ( CreateDynamicObjectNode( nodeGraph, n->GetName(), objListNode->GetCompilerOutputPath() ) == false )
+                if ( CreateDynamicObjectNode( nodeGraph, n->GetName(), objListNode->GetCompilerOutputPath(), AString::GetEmpty(), AString::GetEmpty(), AString::GetEmpty(), Array<AString>() ) == false )
                 {
                     return false; // CreateDynamicObjectNode will have emitted error
                 }
@@ -478,8 +501,10 @@ ObjectListNode::~ObjectListNode() = default;
         }
         else if ( dep.GetNode()->IsAFile() )
         {
+            const AString& outputFile = m_CompilerOutputFiles.IsEmpty() ? AString::GetEmpty() : m_CompilerOutputFiles[i];
+
             // a single file, create the object that will compile it
-            if ( CreateDynamicObjectNode( nodeGraph, dep.GetNode()->GetName(), AString::GetEmpty() ) == false )
+            if ( CreateDynamicObjectNode( nodeGraph, dep.GetNode()->GetName(), AString::GetEmpty(), outputFile, AString::GetEmpty(), AString::GetEmpty(), Array<AString>() ) == false )
             {
                 return false; // CreateDynamicObjectNode will have emitted error
             }
@@ -490,10 +515,132 @@ ObjectListNode::~ObjectListNode() = default;
         }
     }
 
-    // Depend on objects for loose files
-    for ( const AString & file : m_CompilerInputFiles )
+    auto splitOnSemicolon = [](const AString& s, Array<AString>& a) -> void
     {
-        if ( CreateDynamicObjectNode( nodeGraph, file, AString::GetEmpty() ) == false )
+        constexpr char semicolon = ';';
+        char* pb = const_cast<char*>(s.begin());
+        char* pe = pb + s.GetLength();
+        char* pc = ::strchr(pb, semicolon);
+        while (pc != nullptr)
+        {
+            int s_len = static_cast<int>(pc - pb);
+            //*pc = '\0';
+            if (s_len > 0)
+            {
+                a.Append(AString(pb, pc));
+            }
+            pb = pc + 1;
+            pc = ::strchr(pb, semicolon);
+        }
+
+        if (pb != pe)
+        {
+            a.Append(AString(pb));
+        }
+    };
+
+    // Parse ThinLTO imports list string.
+    auto parseImportsString = [&splitOnSemicolon](const AString& importsString, Array<AString>& importsList) -> bool
+    {
+        Array<AString> filesList;
+        splitOnSemicolon(importsString, filesList);
+        for (AString& fileName : filesList)
+        {
+            if (!fileName.IsEmpty() && fileName[0] != '\0')
+                importsList.EmplaceBack(fileName);
+        }
+        return true;
+    };
+
+    auto splitOnCrLf = [](const AString& s, Array<AString>& a) -> void
+    {
+        constexpr const char* cr_lf = "\n\r";
+        char* pb = const_cast<char*>(s.begin());
+        char* pe = pb + s.GetLength();
+        char* pc = ::strpbrk(pb, cr_lf);
+        while (pc != nullptr)
+        {
+            int s_len = static_cast<int>(pc - pb);
+            //*pc = '\0';
+            if (s_len > 0) {
+                a.Append(AString(pb, pc));
+            }
+            pb = pc + 1;
+            pc = ::strpbrk(pb, cr_lf);
+        }
+
+        if (pb != pe) {
+            a.Append(AString(pb));
+        }
+    };
+
+    // Parse ThinLTO import list file.
+    auto parseImportsFile = [&splitOnCrLf](const AString& filePath, Array<AString>& importsList) -> bool {
+        FileStream fs;
+        if (fs.Open(filePath.Get(), FileStream::READ_ONLY) == false)
+        {
+            return false;
+        }
+        uint64_t bufferSize = fs.GetFileSize();
+        Array<char> buffer;
+        buffer.SetSize(bufferSize + sizeof(char));
+        buffer[bufferSize] = '\0';
+        if(fs.ReadBuffer(buffer.Begin(), bufferSize) != bufferSize)
+            return false;
+        AString importsString(buffer.Begin(), buffer.End());
+        Array<AString> filesList;
+        splitOnCrLf(importsString, filesList);
+        for (AString& fileName : filesList) {
+            if (!fileName.IsEmpty() && fileName[0] != '\0')
+                importsList.EmplaceBack(fileName);
+        }
+        return true;
+    };
+
+    // Depend on objects for loose files
+    //for (const AString& file : m_CompilerInputFiles)
+    bool isThinlto = !m_ThinltoSummaryIndexFiles.IsEmpty();
+
+    if (isThinlto) {
+        if (m_ThinltoSummaryIndexFiles.GetSize() != m_CompilerInputFiles.GetSize()) {
+            FLOG_ERROR("ObjectListNode: Number of summary index files is not equal to the number of input files %zu != %zu", m_ThinltoSummaryIndexFiles.GetSize(), m_CompilerInputFiles.GetSize());
+            return false;
+        }
+        if (!m_ThinltoImportFiles.IsEmpty() && (m_ThinltoSummaryIndexFiles.GetSize() != m_ThinltoImportFiles.GetSize())) {
+            FLOG_ERROR("ObjectListNode: Number of summary index files is not equal to the number of import files %zu != %zu", m_ThinltoSummaryIndexFiles.GetSize(), m_ThinltoImportFiles.GetSize());
+            return false;
+        }
+        if (!m_ThinltoImports.IsEmpty() && (m_ThinltoSummaryIndexFiles.GetSize() != m_ThinltoImports.GetSize())) {
+            FLOG_ERROR("ObjectListNode: Number of summary index files is not equal to the number of import files lists %zu != %zu", m_ThinltoSummaryIndexFiles.GetSize(), m_ThinltoImports.GetSize());
+            return false;
+        }
+        if (!m_ThinltoModuleIds.IsEmpty() && (m_ThinltoSummaryIndexFiles.GetSize() != m_ThinltoModuleIds.GetSize())) {
+            FLOG_ERROR("ObjectListNode: Number of summary index files is not equal to the number of bitcode Module IDs %zu != %zu", m_ThinltoSummaryIndexFiles.GetSize(), m_ThinltoModuleIds.GetSize());
+            return false;
+        }
+    }
+
+    auto getThinltoParam = [&isThinlto](const Array<AString>& paramsList, size_t idx) -> const AString&
+    { return isThinlto && !paramsList.IsEmpty() ? paramsList[idx] : AString::GetEmpty(); };
+
+    for (size_t idx = 0; idx < m_CompilerInputFiles.GetSize(); ++idx)
+    {
+        const AString& file = m_CompilerInputFiles[idx];
+
+        const AString& outputFile = getThinltoParam(m_CompilerOutputFiles, idx);
+        const AString& summaryIndex = getThinltoParam(m_ThinltoSummaryIndexFiles, idx);
+        const AString& moduleId = getThinltoParam(m_ThinltoModuleIds, idx);
+
+        const AString& importsFile = getThinltoParam(m_ThinltoImportFiles, idx);
+        const AString& importsString = getThinltoParam(m_ThinltoImports, idx);
+
+        Array<AString> importsList;
+        if (!importsString.IsEmpty())
+            parseImportsString(importsString, importsList);
+        if (!importsFile.IsEmpty())
+            parseImportsFile(importsFile, importsList);
+
+        if (CreateDynamicObjectNode(nodeGraph, file, AString::GetEmpty(), outputFile, summaryIndex, moduleId, importsList) == false)
         {
             return false; // CreateDynamicObjectNode will have emitted error
         }
@@ -700,11 +847,16 @@ void ObjectListNode::GetObjectFileName( const AString & fileName, const AString 
 bool ObjectListNode::CreateDynamicObjectNode( NodeGraph & nodeGraph,
                                               const AString & inputFileName,
                                               const AString & baseDir,
+                                              const AString& outputFileName,
+                                              const AString& thinltoSummaryIndex,
+                                              const AString& thinltoModuleId,
+                                              const Array<AString>& thinltoImportsList,
                                               bool isUnityNode,
                                               bool isIsolatedFromUnityNode )
 {
-    AStackString<> objFile;
-    GetObjectFileName( inputFileName, baseDir, objFile );
+    AString objFile ( outputFileName);
+    if(outputFileName.IsEmpty())
+        GetObjectFileName( inputFileName, baseDir, objFile );
 
     // Create an ObjectNode to compile the above file
     // and depend on that
@@ -723,7 +875,7 @@ bool ObjectListNode::CreateDynamicObjectNode( NodeGraph & nodeGraph,
         }
 
         const BFFToken * token = nullptr;
-        ObjectNode * objectNode = CreateObjectNode( nodeGraph, token, nullptr, flags, m_PreprocessorFlags, m_CompilerOptions, m_CompilerOptionsDeoptimized, m_Preprocessor, m_PreprocessorOptions, objFile, inputFileName, AString::GetEmpty() );
+        ObjectNode * objectNode = CreateObjectNode( nodeGraph, token, nullptr, flags, m_PreprocessorFlags, m_CompilerOptions, m_CompilerOptionsDeoptimized, m_Preprocessor, m_PreprocessorOptions, objFile, inputFileName, AString::GetEmpty(), thinltoSummaryIndex, thinltoModuleId, thinltoImportsList );
         if ( !objectNode )
         {
             FLOG_ERROR( "Failed to create node '%s'!", objFile.Get() );
@@ -774,7 +926,11 @@ ObjectNode * ObjectListNode::CreateObjectNode( NodeGraph & nodeGraph,
                                                const AString & preprocessorOptions,
                                                const AString & objectName,
                                                const AString & objectInput,
-                                               const AString & pchObjectName )
+                                               const AString & pchObjectName,
+                                               const AString& thinltoSummaryIndexFile,
+                                               const AString& thinltoModuleId,
+                                               const Array < AString>& thinltoImportsList)
+
 {
     ObjectNode * node= nodeGraph.CreateNode<ObjectNode>( objectName, iter );
     node->m_Compiler = m_Compiler;
@@ -804,8 +960,12 @@ ObjectNode * ObjectListNode::CreateObjectNode( NodeGraph & nodeGraph,
     node->m_CompilerFlags = flags;
     node->m_PreprocessorFlags = preprocessorFlags;
     node->m_OwnerObjectList = m_Name;
-    node->m_ConcurrencyGroupName = m_ConcurrencyGroupName;
-    node->m_ConcurrencyGroupIndex = m_ConcurrencyGroupIndex;
+    // DTLTO
+    node->m_CompilerOptionsBitcode = m_CompilerOptionsBitcode;
+    node->m_SummaryIndexFile = thinltoSummaryIndexFile;
+    node->m_ThinltoModuleId = thinltoModuleId;
+    node->m_ThinltoDependencyFiles = thinltoImportsList;
+    node->m_CompilerOptionModuleIdMap = m_CompilerOptionModuleIdMap;
 
     if ( !node->Initialize( nodeGraph, iter, function ) )
     {

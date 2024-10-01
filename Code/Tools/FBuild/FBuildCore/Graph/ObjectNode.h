@@ -180,6 +180,12 @@ public:
     static bool GetFakeSystemFailureForNextJob() { return ( sFakeSystemFailureState.Load() > DISABLED ); }
 #endif
 
+    const AString& GetSummaryIndexFile() const { return m_SummaryIndexFile; }
+    const AString& GetThinltoModuleId() const { return m_ThinltoModuleId; }
+    const Array< AString >& GetThinltoDependencyFiles() const { return m_ThinltoDependencyFiles; }
+    const AString& GetThinltoModuleIdMapFile() const { return m_ThinltoModuleIdMapFile; }
+    void SetThinltoModuleIdMapFile(const AString& fileName) const { m_ThinltoModuleIdMapFile = fileName; }
+
 private:
     virtual BuildResult DoBuild( Job * job ) override;
     virtual BuildResult DoBuild2( Job * job, bool racingRemoteJob ) override;
@@ -221,13 +227,16 @@ private:
         PASS_COMPILE,
         PASS_PREP_FOR_SIMPLE_DISTRIBUTION,
     };
-    bool BuildArgs( const Job * job, Args & fullArgs, Pass pass, bool useDeoptimization, bool useShowIncludes, bool useSourceMapping, bool finalize, const AString & overrideSrcFile = AString::GetEmpty() ) const;
+    bool BuildArgs( const Job * job, Args & fullArgs, Pass pass, bool useDeoptimization,
+        bool useShowIncludes, bool useSourceMapping, bool finalize, const AString & overrideSrcFile = AString::GetEmpty(),
+        const AString& overrideSummaryFile = AString::GetEmpty(), const AString& overrideModuleIdFile = AString::GetEmpty()) const;
 
     BuildResult BuildPreprocessedOutput( const Args & fullArgs, Job * job, bool useDeoptimization ) const;
     bool LoadStaticSourceFileForDistribution( const Args & fullArgs, Job * job, bool useDeoptimization ) const;
     void TransferPreprocessedData( const char * data, size_t dataSize, Job * job ) const;
     bool WriteTmpFile( Job * job, AString & tmpDirectory, AString & tmpFileName ) const;
-    BuildResult BuildFinalOutput( Job * job, const Args & fullArgs ) const;
+    bool WriteThinltoDependencies(Job* job, AString& tmpDirectory, Array<AString>& tmpFiles) const;
+    BuildResult BuildFinalOutput( Job * job, const Args & fullArgs, const AString& tmpDirectory ) const;
 
     static void HandleSystemFailures( Job * job, int result, const AString & stdOut, const AString & stdErr );
     bool ShouldUseDeoptimization() const;
@@ -299,6 +308,14 @@ private:
     uint64_t            m_PCHCacheKey                       = 0;
     uint64_t            m_LightCacheKey                     = 0;
     AString             m_OwnerObjectList; // TODO:C This could be a pointer to the node in the future
+
+    // DTLTO
+    AString             m_CompilerOptionsBitcode;    // Compiler options for IR bitcode code generation.
+    AString             m_SummaryIndexFile;          // Summary index file path.
+    AString             m_ThinltoModuleId;           // Input bitcode file Module ID.
+    mutable AString     m_ThinltoModuleIdMapFile;    // Path to a file that contains Module ID map.
+    Array< AString >    m_ThinltoDependencyFiles;    // Array of bitcode dependencies paths.
+    AString             m_CompilerOptionModuleIdMap; // Compiler option to specify Module ID map..
 
     // Not serialized
     Array< AString >    m_Includes;
