@@ -124,16 +124,16 @@ private:
     mutable Mutex   m_Mutex;
 
     // Reflected
-    uint64_t                    m_ToolId;       // Global identifier for this toolchain
-    uint64_t                    m_TimeStamp;    // Time stamp of most recent file
+    uint64_t                    m_ToolId = 0;       // Global identifier for this toolchain
+    uint64_t                    m_TimeStamp = 0;    // Time stamp of most recent file
     AString                     m_MainExecutableRootPath;
     Array< ToolManifestFile >   m_Files;
     Array< AString >            m_CustomEnvironmentVariables;
 
     // Internal state
-    bool            m_Synchronized;
+    bool            m_Synchronized = false;
     const char *    m_RemoteEnvironmentString;
-    void *          m_UserData;
+    void *          m_UserData = nullptr;
 };
 
 //------------------------------------------------------------------------------

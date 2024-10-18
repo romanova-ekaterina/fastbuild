@@ -2,9 +2,12 @@
 //------------------------------------------------------------------------------
 #pragma once
 
+#include <Core/Env/Types.h>
+
 // Forward Declarations
 //------------------------------------------------------------------------------
 class AString;
+template < class T > class Array;
 
 // Defines
 //------------------------------------------------------------------------------
@@ -57,3 +60,9 @@ public:
 };
 
 //------------------------------------------------------------------------------
+
+// Accepts an array of file paths.
+// Return corresponding array of canonical file paths.
+// Also returns a number of absolute paths in the input array and a maximal number of directory levels above of a current directory.
+bool AnalyzeFilePaths(const Array<AString>& filePaths, Array<AString>& canonicalFilePaths, int32_t& numOfAbsPaths, int32_t& levelsUpFromCurrentDir);
+

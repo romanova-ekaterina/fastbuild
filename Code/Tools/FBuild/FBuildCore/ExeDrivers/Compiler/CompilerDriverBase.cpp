@@ -118,6 +118,64 @@ void CompilerDriverBase::Init( const ObjectNode * objectNode,
         }
     }
 
+    // %5 -> ThinLTO Summary Index File
+    {
+        const char* const found = token.Find("%5");
+        if (found)
+        {
+            outFullArgs += AStackString<>(token.Get(), found);
+            if (m_OverrideSummaryIndexFile.IsEmpty())
+            {
+                if (m_RelativeBasePath.IsEmpty() == false)
+                {
+                    AStackString<> relativeFileName;
+                    PathUtils::GetRelativePath(m_RelativeBasePath, m_ObjectNode->GetSummaryIndexFile(), relativeFileName);
+                    outFullArgs += relativeFileName;
+                }
+                else
+                {
+                    outFullArgs += m_ObjectNode->GetSummaryIndexFile();
+                }
+            }
+            else
+            {
+                outFullArgs += m_OverrideSummaryIndexFile;
+            }
+            outFullArgs += AStackString<>(found + 2, token.GetEnd());
+            outFullArgs.AddDelimiter();
+            return true;
+        }
+    }
+
+    // %7 -> ThinLTO Module Id Map File
+    {
+        const char* const found = token.Find("%7");
+        if (found)
+        {
+            outFullArgs += AStackString<>(token.Get(), found);
+            if (m_OverrideModuleIdMapFile.IsEmpty())
+            {
+                if (m_RelativeBasePath.IsEmpty() == false)
+                {
+                    AStackString<> relativeFileName;
+                    PathUtils::GetRelativePath(m_RelativeBasePath, m_ObjectNode->GetThinltoModuleIdMapFile(), relativeFileName);
+                    outFullArgs += relativeFileName;
+                }
+                else
+                {
+                    outFullArgs += m_ObjectNode->GetThinltoModuleIdMapFile();
+                }
+            }
+            else
+            {
+                outFullArgs += m_OverrideModuleIdMapFile;
+            }
+            outFullArgs += AStackString<>(found + 2, token.GetEnd());
+            outFullArgs.AddDelimiter();
+            return true;
+        }
+    }
+
     return false;
 }
 

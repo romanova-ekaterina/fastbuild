@@ -35,7 +35,7 @@ public:
     void *          Release( size_t & outSize );
 
 private:
-    enum : uint32_t { MAX_FILES = 4 };
+    //enum : uint32_t { MAX_FILES = 4 };
 
     ConstMemoryStream * m_ReadStream;
     MemoryStream *      m_WriteStream;

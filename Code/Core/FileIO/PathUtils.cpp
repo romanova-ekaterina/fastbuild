@@ -5,9 +5,15 @@
 //------------------------------------------------------------------------------
 #include "PathUtils.h"
 #include "Core/Strings/AStackString.h"
+#include "Core/Math/Conversions.h"
+#include "Core/Math/Random.h"
+
 
 #include <ctype.h>
 #include <string.h>
+#include <memory.h>
+#include <stdio.h>
+#include <stdlib.h>
 
 // Exists
 //------------------------------------------------------------------------------
@@ -341,16 +347,16 @@
 // One of the major problem we have to overcome for Distributed ThinLTO project is that path names on the local machine
 // that serve as module ids and that are hardcoded in the summary index files do not match remote directory file path names.
 // FASTBuild doesn't run compilation jobs on a virtual file system (like chroot or docker), instead it is using a real file
-// system and in general case we cannot map file paths from the local file system to the remote file system.
+// system and in general case we cannot map file paths from the local file system to the remote file system.  
 
 // Luckily, almost always for Distributed ThinLTO path names are relative
-// to the project directory. The idea is, that if all the files have one common ancestor node in the local file system and
+// to the project directory. The idea is, that if all the files have one common ancestor node in the local file system and 
 // all the file paths are relative, then we can create a sub directory on the remote machine that
 // would mimic the location of the local files. In this case, the module ids for Distributed ThinLTO
-// will stay the same.
-//
+// will stay the same. 
+// 
 // The purpose of the code below is to implement a simpified virtual file system to write there all the paths that participate
-// in the DTLTO whenever possible (e.g. it cannot be done if we have absolute paths).
+// in the DTLTO whenever possible (e.g. it cannot be done if we have absolute paths).  
 namespace dtlto
 {
 
@@ -397,7 +403,7 @@ public:
 
     // Initializes the file node with the given name.
     FileNode( const AString & file_name )
-        : name( file_name )
+        : name( file_name ) 
     {}
 
     // GetParent
@@ -453,7 +459,7 @@ public:
     // Initializes the directory node with the given name.
     DirectoryNode( const AString & dir_name )
         : parent( nullptr ),
-          name( dir_name )
+          name( dir_name ) 
     {}
 
     // Deletes all child directory nodes and clears the name, files, and childs arrays.
@@ -905,7 +911,7 @@ void ParsePath( const AString & path,
 #ifdef __WINDOWS__
         if ( BeginsWithSlash( part_ptr ) )
         {
-            rs.Get(); // skip over slash.
+            rs.Get(); // skip over slash.   
             path_parts.AddDirsPart( NATIVE_SLASH_STR );
         }
         else
@@ -960,4 +966,318 @@ void ParsePath( const AString & path,
     else
         path_parts.AddDirsPart( part_ptr );
 }
+
+
+// FileSystemImpl
+//------------------------------------------------------------------------------
+// Represents the implementation of a file system, including the root directory,
+// current working directory, and methods to manipulate directories and files.
+struct FileSystemImpl
+{
+    DirectoryNode * root = nullptr; // Pointer to the root directory node
+    DirectoryNode * cwd = nullptr;  // Pointer to the current working directory node
+
+    // GetCurrentDirectoryNode
+    //------------------------------------------------------------------------------
+    // Returns a pointer to the current working directory node.
+    DirectoryNode * GetCurrentDirectoryNode()
+    {
+        return cwd;
+    }
+
+    // Destructor
+    //------------------------------------------------------------------------------
+    // Deletes the root and current working directory nodes if they exist.
+    virtual ~FileSystemImpl()
+    {
+        if ( root )
+            delete root;
+        if ( cwd )
+            delete cwd;
+    }
+
+    // CreateRootDirectoryNode
+    //------------------------------------------------------------------------------
+    // Creates the root directory node if it does not already exist.
+    // Returns a pointer to the root directory node.
+    DirectoryNode * CreateRootDirectoryNode()
+    {
+        if ( root )
+            return root;
+        root = DirectoryNode::Create( NATIVE_SLASH_STR );
+        if ( !root )
+            return nullptr;
+        root->SetParent( nullptr );
+        return root;
+    }
+
+    // CreateCurrentDirectoryNode
+    //------------------------------------------------------------------------------
+    // Creates the current working directory node if it does not already exist.
+    // Returns a pointer to the current working directory node.
+    DirectoryNode * CreateCurrentDirectoryNode()
+    {
+        if ( cwd )
+            return cwd;
+        cwd = DirectoryNode::Create( "." );
+        if ( !cwd )
+            return nullptr;
+        return cwd;
+    }
+
+    // CreateDirectory
+    //------------------------------------------------------------------------------
+    // Creates a directory structure based on the given path parts.
+    // Returns true if the directory was successfully created, false otherwise.
+    bool CreateDirectory( const PathParts & path_parts,
+                          DirectoryNode *& dir_node )
+    {
+        DirectoryNode * cur_dir = nullptr;
+        size_t idx = 0;
+        dir_node = nullptr;
+#ifdef RANDOM_NAME_FOR_PARENT_DIR
+        Random rand_gen;
+#endif
+        if ( path_parts.IsAbsolute() )
+        {
+            if ( nullptr == ( cur_dir = CreateRootDirectoryNode() ) )
+                return false;
+            idx++;
+        }
+        else
+        {
+            if ( nullptr == ( cur_dir = CreateCurrentDirectoryNode() ) )
+                return false;
+        }
+
+        for ( ; idx < path_parts.GetDirsSize(); ++idx )
+        {
+            const AString & path_part = path_parts.GetDirsPart( idx );
+            if ( IsDot( path_part ) )
+            {
+                continue;
+            }
+            else if ( IsDoubleDot( path_part ) )
+            {
+                DirectoryNode * parent_dir;
+                parent_dir = cur_dir->GetParent();
+                if ( !parent_dir )
+                {
+#ifdef RANDOM_NAME_FOR_PARENT_DIR
+                    AString rand_str;
+                    rand_gen.GetRandString( rand_str );
+                    parent_dir = DirectoryNode::Create( rand_str );
+#else
+                    parent_dir = DirectoryNode::Create( ".." );
+#endif
+                    if ( !parent_dir )
+                        return false;
+                    parent_dir->GetChilds().Append( cur_dir );
+                    cur_dir->SetParent( parent_dir );
+                }
+                cur_dir = parent_dir;
+            }
+            else
+            {
+                if ( nullptr == ( cur_dir = cur_dir->AddChildDirectory( path_part ) ) )
+                    return false;
+            }
+        }
+        dir_node = cur_dir;
+        return true;
+    }
+
+    // OpenDirectory
+    //------------------------------------------------------------------------------
+    // Opens a directory based on the given path parts.
+    // Returns true if the directory was successfully opened, false otherwise.
+    bool OpenDirectory( const PathParts & path_parts,
+                        DirectoryNode *& dir_node )
+    {
+        DirectoryNode * cur_dir = nullptr;
+        size_t idx = 0;
+        dir_node = nullptr;
+
+        if ( path_parts.IsAbsolute() )
+        {
+            if ( nullptr == ( cur_dir = CreateRootDirectoryNode() ) )
+                return false;
+            idx++;
+        }
+        else
+        {
+            if ( nullptr == ( cur_dir = CreateCurrentDirectoryNode() ) )
+                return false;
+        }
+
+        for ( ; idx < path_parts.GetDirsSize(); ++idx )
+        {
+            const AString & path_part = path_parts.GetDirsPart( idx );
+            if ( IsDot( path_part ) )
+            {
+                continue;
+            }
+            else if ( IsDoubleDot( path_part ) )
+            {
+                DirectoryNode * parent_dir = cur_dir->GetParent();
+                if ( !parent_dir )
+                {
+                    return false;
+                }
+                cur_dir = parent_dir;
+            }
+            else
+            {
+                if ( nullptr == ( cur_dir = cur_dir->FindChildDirectory( path_part ) ) )
+                    return false;
+            }
+        }
+        dir_node = cur_dir;
+        return true;
+    }
+
+    // CreateFile
+    //------------------------------------------------------------------------------
+    // Creates a file based on the given path parts.
+    // Returns true if the file was successfully created, false otherwise.
+    bool CreateFile( const PathParts & path_parts,
+                     DirectoryNode *& dir_node,
+                     const FileNode *& file_node )
+    {
+        if ( !CreateDirectory( path_parts, dir_node ) )
+            return false;
+        file_node = dir_node->AddFile( path_parts.GetFileName() );
+        return file_node != nullptr; 
+    }
+
+    // CreateFile
+    //------------------------------------------------------------------------------
+    // Creates a file based on the given file path.
+    // Returns true if the file was successfully created, false otherwise.
+    bool CreateFile( const AString & file_path )
+    {
+        PathParts path_parts;
+        ParsePath( file_path, true, path_parts );
+        DirectoryNode * dir_node;
+        const FileNode * file_node;
+        return CreateFile( path_parts, dir_node, file_node );
+    }
+
+    // OpenFile
+    //------------------------------------------------------------------------------
+    // Opens a file based on the given file path.
+    // Returns true if the file was successfully opened, false otherwise.
+    bool OpenFile( const AString & file_path,
+                   DirectoryNode *& dir_node,
+                   FileNode *& file_node )
+    {
+        PathParts path_parts;
+        ParsePath( file_path, true, path_parts );
+        if ( !OpenDirectory( path_parts, dir_node ) )
+            return false;
+        file_node = dir_node->FindFile( path_parts.GetFileName() );
+        return true;
+    }
+
+    // MakeCanonicalFilePath
+    //------------------------------------------------------------------------------
+    // Creates a canonical file path based on the given file path.
+    // Returns true if the canonical path was successfully created, false otherwise.
+    bool MakeCanonicalFilePath( const AString & file_path,
+                                AString & out_path )
+    {
+        PathParts path_parts;
+        ParsePath( file_path, true, path_parts );
+        DirectoryNode * dir_node = nullptr;
+        const FileNode * file_node = nullptr;
+        if ( !CreateFile( path_parts, dir_node, file_node ) )
+            return false;
+        Array< AString > out_path_parts;
+        out_path_parts.SetCapacity( path_parts.GetDirsSize() + 1 );
+        DirectoryNode * cur_node = dir_node;
+        while ( cur_node )
+        {
+            out_path_parts.EmplaceBack( cur_node->GetName() );
+            cur_node = cur_node->GetParent();
+        }
+        for ( int64_t idx = (int64_t)out_path_parts.GetSize() - 1; idx > 0; --idx )
+        {
+            out_path += out_path_parts[ (size_t)idx ];
+            out_path += NATIVE_SLASH_STR;
+        }
+        out_path += file_node->GetName();
+        return true;
+    }
+
+    // LevelsUpFromCurrentDirectoryNode
+    //------------------------------------------------------------------------------
+    // Calculates the number of levels up from the current directory node to the given directory node.
+    void LevelsUpFromCurrentDirectoryNode( const DirectoryNode * dir_node,
+                                           int32_t & levels_up )
+    {
+        const DirectoryNode * cur_node = dir_node;
+        bool up_of_cwd = false;
+        levels_up = 0;
+        while ( cur_node )
+        {
+            if ( up_of_cwd )
+                ++levels_up;
+            if ( !up_of_cwd && cur_node == GetCurrentDirectoryNode() )
+                up_of_cwd = true;
+            cur_node = cur_node->GetParent();
+        }
+    }
+};
+
+} // namespace dtlto
+
+// AnalyzeFilePaths
+//------------------------------------------------------------------------------
+// Analyzes the given file paths to generate their canonical forms, count the number
+// of absolute paths, and determine the maximum levels up from the current directory.
+// 
+// Parameters:
+// - filePaths: Array of file paths to be analyzed.
+// - canonicalFilePaths: Array to store the canonical forms of the file paths.
+// - numOfAbsPaths: Reference to an integer to store the count of absolute paths.
+// - levelsUpFromCurrentDir: Reference to an integer to store the maximum levels up
+//   from the current directory.
+//
+// Returns:
+// - true if all file paths were successfully analyzed, false otherwise.
+bool AnalyzeFilePaths( const Array< AString > & filePaths,
+                       Array< AString > & canonicalFilePaths,
+                       int32_t & numOfAbsPaths,
+                       int32_t & levelsUpFromCurrentDir )
+{
+    levelsUpFromCurrentDir = 0;
+    numOfAbsPaths = 0;
+    dtlto::FileSystemImpl fs;
+
+    for ( const AString & cur_path : filePaths )
+    {
+        dtlto::DirectoryNode * dir_node;
+        bool rc = fs.CreateFile( cur_path );
+        if ( !rc )
+            return false;
+
+        dtlto::FileNode * file_node;
+        rc = fs.OpenFile( cur_path, dir_node, file_node );
+        if ( !rc )
+            return false;
+
+        AString canonical_path;
+        rc = fs.MakeCanonicalFilePath( cur_path, canonical_path );
+        if ( !rc )
+            return false;
+
+        canonicalFilePaths.Append( canonical_path );
+        if ( dtlto::IsRootPath( canonical_path.Get() ) )
+            numOfAbsPaths++;
+
+        int32_t levels_up;
+        fs.LevelsUpFromCurrentDirectoryNode( dir_node, levels_up );
+        levelsUpFromCurrentDir = Math::Max( levelsUpFromCurrentDir, levels_up );
+    }
+    return true;
 }
