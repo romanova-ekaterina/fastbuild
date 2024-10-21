@@ -174,10 +174,11 @@ CompilerDriver_GCCClang::~CompilerDriver_GCCClang() = default;
 /*virtual*/ void CompilerDriver_GCCClang::AddAdditionalArgs_Common( bool isLocal,
                                                                     Args & outFullArgs ) const
 {
-    if ( m_ForceColoredDiagnostics )
-    {
-        outFullArgs += " -fdiagnostics-color=always";
-    }
+//   TODO: Katya - clang has only -fcolor-diagnostics option, this option is invalid
+//    if ( m_ForceColoredDiagnostics )
+//    {
+//        outFullArgs += " -fdiagnostics-color=always";
+//    }
 
     // Add args for source mapping
     if ( ( m_SourceMapping.IsEmpty() == false ) && isLocal )

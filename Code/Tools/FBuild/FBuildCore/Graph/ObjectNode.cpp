@@ -191,14 +191,12 @@ ObjectNode::ObjectNode()
         }
     }
     if (IsThinlto && !m_CompilerOptionsBitcode.IsEmpty()) {
-        AString CombinedCompilerOptions(m_CompilerOptionsBitcode);
-        CombinedCompilerOptions += " ";
+        m_CompilerOptions += " ";
+        m_CompilerOptions += m_CompilerOptionsBitcode;
         if (!m_CompilerOptionModuleIdMap.IsEmpty()) {
-            CombinedCompilerOptions += m_CompilerOptionModuleIdMap;
-            CombinedCompilerOptions += " ";
+            m_CompilerOptions += " ";
+            m_CompilerOptions += m_CompilerOptionModuleIdMap;
         }
-        CombinedCompilerOptions += m_CompilerOptions;
-        m_CompilerOptions = CombinedCompilerOptions;
     }
     // Store Dependencies
     size_t staticDepsSize = (2 + 2 + precompiledHeader.GetSize() + (preprocessor ? 1 : 0) + compilerForceUsing.GetSize() + thinltoDependencyFiles.GetSize() + summaryIndexFile.GetSize());
